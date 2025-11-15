@@ -1,0 +1,253 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: next-websocket-chat-backend
+
+Parameters:
+  ModelID:
+    Type: String
+    Default: apac.anthropic.claude-3-5-sonnet-20240620-v1:0 #Cross-region Inference
+  APIGatewayStage:
+    Type: String
+    Default: dev
+
+Resources:
+  # IAM Policy と IAM Role
+  HandlerDefaultRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName : !Sub "${AWS::StackName}-HandlerDefaultRole"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+ 
+  SendTextHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName : !Sub "${AWS::StackName}-SendTextHandlerRole"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      
+  BedrockServiceRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 'bedrock:InvokeModel'
+              - 'bedrock:InvokeModelWithResponseStream'
+            Effect: Allow
+            Resource: 
+              - '*'
+        Version:  "2012-10-17"
+      PolicyName: !Sub "${AWS::StackName}-HandlerServiceRolePolicyBedrock"
+      Roles:
+        - Ref: SendTextHandlerRole
+
+  ExecuteApiServiceRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 'execute-api:*'
+            Effect: Allow
+            Resource:
+              - !Sub arn:aws:execute-api:*:${AWS::AccountId}:*/*/*/*
+        Version:  "2012-10-17"
+      PolicyName: !Sub "${AWS::StackName}-HandlerServiceRolePolicyExecuteApi"
+      Roles:
+        - Ref: SendTextHandlerRole
+        - Ref: HandlerDefaultRole
+
+  # WebSocket API
+  ApiGatewayWS:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+  # 関数
+  ConnectHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/connect-handler
+      Role: !GetAtt HandlerDefaultRole.Arn
+      Environment:
+        Variables:
+          API_ENDPOINT: !Sub https://${ApiGatewayWS}.execute-api.${AWS::Region}.amazonaws.com
+          STAGE: !Ref APIGatewayStage
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Timeout: 10
+  DisconnectHandler:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: functions/disconnect-handler
+      Role: !GetAtt HandlerDefaultRole.Arn
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Timeout: 10
+  SendTextHandler:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: functions/sendtext
+      Role: !GetAtt SendTextHandlerRole.Arn
+      Environment:
+        Variables:
+          API_ENDPOINT: !Sub https://${ApiGatewayWS}.execute-api.${AWS::Region}.amazonaws.com
+          STAGE: !Ref APIGatewayStage
+          MODEL_ID: !Ref ModelID
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Timeout: 180
+  DefaultHandler:
+    Type: AWS::Serverless::Function 
+    Properties:
+      CodeUri: functions/default-handler
+      Role: !GetAtt HandlerDefaultRole.Arn
+      Environment:
+        Variables:
+          API_ENDPOINT: !Sub https://${ApiGatewayWS}.execute-api.${AWS::Region}.amazonaws.com
+          STAGE: !Ref APIGatewayStage
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Timeout: 10
+    
+  ConnectHandlerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ConnectHandler.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  DisconnectHandlerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DisconnectHandler.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+    
+  SendTextHandlerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SendTextHandler.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  DefaultHandlerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DefaultHandler.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+  
+  ApiGatewayConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGatewayWS
+      RouteKey: $connect
+      OperationName: ConnectRoute
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref ApiGatewayConnectIntegration
+    
+  ApiGatewayConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGatewayWS
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConnectHandler.Arn}/invocations
+      IntegrationMethod: POST
+
+  ApiGatewayDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGatewayWS
+      RouteKey: $disconnect
+      OperationName: DisconnectRoute
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref ApiGatewayDisconnectIntegration
+
+  ApiGatewayDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGatewayWS
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DisconnectHandler.Arn}/invocations
+      IntegrationMethod: POST
+
+  ApiGatewaySendTextRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGatewayWS
+      RouteKey: sendtext
+      OperationName: SendTextRoute
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref ApiGatewaySendTextIntegration
+
+  ApiGatewaySendTextIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGatewayWS
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendTextHandler.Arn}/invocations
+      IntegrationMethod: POST
+
+  ApiGatewayDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiGatewayWS
+      RouteKey: $default
+      OperationName: DefaultRoute
+      Target: !Join
+        - /
+        - - integrations
+          - !Ref ApiGatewayDefaultIntegration
+
+  ApiGatewayDefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiGatewayWS
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DefaultHandler.Arn}/invocations
+      IntegrationMethod: POST
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ApiGatewayConnectRoute
+      - ApiGatewayDisconnectRoute
+      - ApiGatewaySendTextRoute
+      - ApiGatewayDefaultRoute
+    Properties:
+      ApiId: !Ref ApiGatewayWS
+
+  ApiGatawayStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: !Ref APIGatewayStage
+      Description: Dev Stage
+      DeploymentId: !Ref ApiGatewayDeployment
+      ApiId: !Ref ApiGatewayWS
+
+Outputs:
+  ApiGatewayWSEndpoint:
+    Value: !Sub wss://${ApiGatewayWS}.execute-api.${AWS::Region}.amazonaws.com/${APIGatewayStage}
