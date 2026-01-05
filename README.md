@@ -1,7 +1,7 @@
 # next-websocket-chat-backend
 
 * 下記をフロントエンドとして使用する
-  - (https://github.com/tetsuo-nobe/next-websocket-chat-)
+  - (https://github.com/tetsuo-nobe/next-websocket-chat)
 
 * このバックエンドでは、Amazon API Gateway の WebSocket API と統合した AWS Lambda 関数を作成する。
 
